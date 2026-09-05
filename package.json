@@ -1,0 +1,18 @@
+{
+  "name": "sala-de-proyeccion",
+  "version": "4.0.0",
+  "description": "Sala de Proyección — generación de video con PostgreSQL/Supabase Storage y fallback local.",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.0",
+    "bcryptjs": "^2.4.3",
+    "connect-pg-simple": "^10.0.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-session": "^1.18.0",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.16.3"
+  },
+  "engines": { "node": ">=18" }
+}
