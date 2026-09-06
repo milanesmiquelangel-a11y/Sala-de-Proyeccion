@@ -9,19 +9,20 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
+const { Client, handle_file } = require('@gradio/client');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const POLLINATIONS_API_KEY = process.env.POLLINATIONS_API_KEY;
-const POLLINATIONS_APP_KEY = process.env.POLLINATIONS_APP_KEY;
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 const MAX_GENERATIONS_PER_HOUR = parseInt(process.env.MAX_GENERATIONS_PER_HOUR || '5', 10);
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
 const USE_SUPABASE = !!(process.env.SUPABASE_URL && SUPABASE_SECRET_KEY);
 const USE_PG_SESSION = process.env.USE_PG_SESSION === 'true';
 const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'media';
+const HF_TOKEN = process.env.HF_TOKEN;
+const HF_SPACE = 'zerogpu-aoti/wan2-2-fp8da-aoti-faster';
 
-if (!POLLINATIONS_API_KEY && !POLLINATIONS_APP_KEY) console.error('Falta POLLINATIONS_API_KEY o POLLINATIONS_APP_KEY.');
+if (!HF_TOKEN) console.warn('HF_TOKEN no está configurado. La generación Wan2.2 permanecerá desactivada hasta añadirlo en Render.');
 if (!USE_SUPABASE) console.warn('Supabase no está configurado. El proyecto usará almacenamiento local temporal.');
 if (!USE_PG_SESSION) console.warn('Sesiones PostgreSQL desactivadas temporalmente; se usa almacenamiento de sesión en memoria.');
 
@@ -48,9 +49,8 @@ const videosDir = path.join(__dirname, 'public', 'videos');
 fs.mkdirSync(uploadsDir, { recursive: true });
 fs.mkdirSync(videosDir, { recursive: true });
 
-const storage = multer.memoryStorage();
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const ok = ['image/jpeg', 'image/png', 'image/webp'].includes(file.mimetype);
@@ -86,8 +86,14 @@ function requireLogin(req, res, next) {
   next();
 }
 
-const BLOCKED_TERMS = ['contenido sexual con menores', 'child sexual', 'csam', 'violencia sexual', 'sexual violence', 'como fabricar una bomba', 'how to make a bomb', 'como fabricar armas', 'weapon manufacturing instructions'];
-function isPromptSafe(prompt) { const lower = prompt.toLowerCase(); return !BLOCKED_TERMS.some(t => lower.includes(t)); }
+const BLOCKED_TERMS = [
+  'contenido sexual con menores', 'child sexual', 'csam', 'violencia sexual', 'sexual violence',
+  'como fabricar una bomba', 'how to make a bomb', 'como fabricar armas', 'weapon manufacturing instructions'
+];
+function isPromptSafe(prompt) {
+  const lower = prompt.toLowerCase();
+  return !BLOCKED_TERMS.some(t => lower.includes(t));
+}
 
 async function dbUserByEmail(email) {
   if (!USE_SUPABASE) return readDB().users.find(u => u.email.toLowerCase() === email.toLowerCase()) || null;
@@ -147,23 +153,24 @@ async function signedUrl(pathname, expires=3600) {
   return data.signedUrl;
 }
 async function storageUpload(filePath, buffer, contentType) {
-  if (!USE_SUPABASE) { const local = path.join(filePath.startsWith('images/')?uploadsDir:videosDir, path.basename(filePath)); fs.writeFileSync(local, buffer); return '/'+(filePath.startsWith('images/')?'uploads/':'videos/')+path.basename(filePath); }
+  if (!USE_SUPABASE) {
+    const local = path.join(filePath.startsWith('images/') ? uploadsDir : videosDir, path.basename(filePath));
+    fs.writeFileSync(local, buffer);
+    return '/' + (filePath.startsWith('images/') ? 'uploads/' : 'videos/') + path.basename(filePath);
+  }
   const { error } = await supabase.storage.from(STORAGE_BUCKET).upload(filePath, buffer, { contentType, upsert:false, cacheControl:'31536000' });
   if (error) throw error;
   return filePath;
 }
 async function storageRemove(paths) {
   const clean=paths.filter(Boolean); if(!clean.length)return;
-  if (!USE_SUPABASE) { for(const p of clean){ const dir=p.startsWith('images/')?uploadsDir:videosDir; const f=path.join(dir,path.basename(p)); if(fs.existsSync(f))fs.unlinkSync(f); } return; }
-  const { error }=await supabase.storage.from(STORAGE_BUCKET).remove(clean); if(error) console.error('Storage remove:',error.message);
+  if (!USE_SUPABASE) {
+    for(const p of clean){ const dir=p.startsWith('images/')?uploadsDir:videosDir; const f=path.join(dir,path.basename(p)); if(fs.existsSync(f))fs.unlinkSync(f); }
+    return;
+  }
+  const { error }=await supabase.storage.from(STORAGE_BUCKET).remove(clean);
+  if(error) console.error('Storage remove:',error.message);
 }
-
-function pollinationsRedirectUri(req) {
-  const proto = req.headers['x-forwarded-proto'] || req.protocol;
-  return `${proto}://${req.get('host')}/api/pollinations/callback`;
-}
-function base64Url(buffer) { return buffer.toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
-function pkceChallenge(verifier) { return base64Url(crypto.createHash('sha256').update(verifier).digest()); }
 
 app.post('/api/register', async (req,res)=>{
   try {
@@ -188,98 +195,106 @@ app.post('/api/login', async (req,res)=>{
 app.post('/api/logout',(req,res)=>req.session.destroy(()=>res.json({ok:true})));
 app.get('/api/me',async(req,res)=>{try{if(!req.session.userId)return res.status(401).json({error:'No has iniciado sesión.'});const u=await dbUserById(req.session.userId);if(!u)return res.status(401).json({error:'Sesión inválida.'});res.json({email:u.email});}catch(e){console.error('Session lookup error:',e);res.status(500).json({error:'Error de sesión.'});}});
 
-app.get('/api/pollinations/status',requireLogin,(req,res)=>{
-  const connected=!!(req.session.pollinationsAccessToken && (!req.session.pollinationsExpiresAt || req.session.pollinationsExpiresAt>Date.now()+30000));
-  if(!connected){delete req.session.pollinationsAccessToken;delete req.session.pollinationsExpiresAt;}
-  res.json({configured:!!POLLINATIONS_APP_KEY,connected});
+app.get('/api/video-provider/status',requireLogin,(req,res)=>{
+  res.json({configured:!!HF_TOKEN, provider:'Hugging Face ZeroGPU', space:HF_SPACE, requiresImage:true, maxDuration:5});
 });
-
-app.get('/api/pollinations/connect',requireLogin,(req,res)=>{
-  if(!POLLINATIONS_APP_KEY)return res.status(503).json({error:'La conexión de Pollinations todavía no está configurada en el servidor.'});
-  const state=crypto.randomBytes(24).toString('hex');
-  const verifier=base64Url(crypto.randomBytes(48));
-  req.session.pollinationsOAuth={state,verifier};
-  const params=new URLSearchParams({response_type:'code',client_id:POLLINATIONS_APP_KEY,redirect_uri:pollinationsRedirectUri(req),scope:'usage',state,code_challenge:pkceChallenge(verifier),code_challenge_method:'S256',expiry:'7',budget:'5'});
-  res.redirect(`https://enter.pollinations.ai/authorize?${params.toString()}`);
-});
-
-app.get('/api/pollinations/callback',requireLogin,async(req,res)=>{
-  const oauth=req.session.pollinationsOAuth;
-  delete req.session.pollinationsOAuth;
-  if(req.query.error)return res.redirect('/?pollinations=denied');
-  if(!oauth || !req.query.code || req.query.state!==oauth.state)return res.redirect('/?pollinations=invalid');
-  try{
-    const response=await fetch('https://enter.pollinations.ai/api/oauth/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({grant_type:'authorization_code',code:String(req.query.code),client_id:POLLINATIONS_APP_KEY,redirect_uri:pollinationsRedirectUri(req),code_verifier:oauth.verifier})});
-    const data=await response.json().catch(()=>({}));
-    if(!response.ok || !data.access_token)throw new Error(data.error_description||data.error||'No se pudo obtener la autorización de Pollinations.');
-    req.session.pollinationsAccessToken=data.access_token;
-    req.session.pollinationsExpiresAt=Date.now()+Number(data.expires_in||604800)*1000;
-    res.redirect('/?pollinations=connected');
-  }catch(e){console.error('Pollinations OAuth error:',e);res.redirect('/?pollinations=error');}
-});
-
-app.post('/api/pollinations/disconnect',requireLogin,(req,res)=>{delete req.session.pollinationsAccessToken;delete req.session.pollinationsExpiresAt;res.json({ok:true});});
 
 app.get('/api/history',requireLogin,async(req,res)=>{
-  try{const rows=await listGenerations(req.session.userId);const generations=await Promise.all(rows.map(async g=>({...g,videoUrl:await signedUrl(g.videoPath),imageUrl:g.imagePath?await signedUrl(g.imagePath):null})));res.json({generations});}
-  catch(e){console.error(e);res.status(500).json({error:'No se pudo cargar el historial.'});}
+  try{
+    const rows=await listGenerations(req.session.userId);
+    const generations=await Promise.all(rows.map(async g=>({...g,videoUrl:await signedUrl(g.videoPath),imageUrl:g.imagePath?await signedUrl(g.imagePath):null})));
+    res.json({generations});
+  } catch(e){console.error(e);res.status(500).json({error:'No se pudo cargar el historial.'});}
 });
 
 app.post('/api/upload',requireLogin,upload.single('image'),async(req,res)=>{
-  try{if(!req.file)return res.status(400).json({error:'No se recibió ninguna imagen.'});const ext=req.file.mimetype==='image/png'?'.png':req.file.mimetype==='image/webp'?'.webp':'.jpg';const filePath=`images/${req.session.userId}/${crypto.randomUUID()}${ext}`;await storageUpload(filePath,req.file.buffer,req.file.mimetype);const url=await signedUrl(filePath,7200);res.json({url,path:filePath});}
-  catch(e){console.error(e);res.status(500).json({error:'No se pudo guardar la imagen.'});}
+  try{
+    if(!req.file)return res.status(400).json({error:'No se recibió ninguna imagen.'});
+    const ext=req.file.mimetype==='image/png'?'.png':req.file.mimetype==='image/webp'?'.webp':'.jpg';
+    const filePath=`images/${req.session.userId}/${crypto.randomUUID()}${ext}`;
+    await storageUpload(filePath,req.file.buffer,req.file.mimetype);
+    const url=await signedUrl(filePath,7200);
+    res.json({url,path:filePath});
+  } catch(e){console.error(e);res.status(500).json({error:'No se pudo guardar la imagen.'});}
 });
 
 app.delete('/api/history/:id',requireLogin,async(req,res)=>{
-  try{const g=await deleteGeneration(req.params.id,req.session.userId);if(!g)return res.status(404).json({error:'Video no encontrado.'});await storageRemove([g.videoPath,g.imagePath]);res.json({ok:true});}
-  catch(e){console.error(e);res.status(500).json({error:'No se pudo eliminar el video.'});}
+  try{
+    const g=await deleteGeneration(req.params.id,req.session.userId);
+    if(!g)return res.status(404).json({error:'Video no encontrado.'});
+    await storageRemove([g.videoPath,g.imagePath]);
+    res.json({ok:true});
+  } catch(e){console.error(e);res.status(500).json({error:'No se pudo eliminar el video.'});}
 });
 
+const HF_NEGATIVE_PROMPT='overexposed, static, blurry, subtitles, text, low quality, JPEG artifacts, ugly, deformed, extra fingers, bad hands, bad face, malformed limbs, fused fingers, still frame, cluttered background, three legs, people walking backwards';
+
+async function generateWanVideo({imageUrl,prompt,duration}) {
+  if(!HF_TOKEN) throw Object.assign(new Error('Hugging Face no está configurado todavía.'),{statusCode:503});
+  const client=await Client.connect(HF_SPACE,{hf_token:HF_TOKEN});
+  const safeDuration=Math.min(5,Math.max(0.5,Number(duration)||3));
+  const result=await client.predict('/generate_video',[
+    handle_file(imageUrl),
+    prompt,
+    4,
+    HF_NEGATIVE_PROMPT,
+    safeDuration,
+    1,
+    1,
+    Math.floor(Math.random()*2147483647),
+    true
+  ]);
+  const value=result?.data?.[0];
+  const videoUrl=typeof value==='string' ? value : (value?.url || value?.video?.url || value?.path);
+  if(!videoUrl) throw new Error('Wan2.2 no devolvió el vídeo.');
+  if(/^https?:\/\//i.test(videoUrl)) {
+    const r=await fetch(videoUrl,{headers:{Authorization:`Bearer ${HF_TOKEN}`}});
+    if(!r.ok) throw new Error(`No se pudo descargar el vídeo generado (${r.status}).`);
+    return Buffer.from(await r.arrayBuffer());
+  }
+  throw new Error('Wan2.2 devolvió una ruta interna no descargable.');
+}
+
 app.post('/api/generate-video',requireLogin,async(req,res)=>{
-  const pollinationsKey=req.session.pollinationsAccessToken || (!POLLINATIONS_APP_KEY ? POLLINATIONS_API_KEY : null);
-  if(!pollinationsKey)return res.status(401).json({error:'Conecta tu cuenta de Pollinations antes de generar vídeos.'});
   try{
-    const {prompt,model,aspectRatio,duration,audio,imageUrl,imagePath}=req.body||{};
+    if(!HF_TOKEN)return res.status(503).json({error:'La generación gratuita de Wan2.2 todavía no está configurada en el servidor.'});
+    const {prompt,duration,imageUrl,imagePath}=req.body||{};
     if(!prompt||typeof prompt!=='string'||!prompt.trim())return res.status(400).json({error:'Falta describir la escena.'});
     if(prompt.length>2000)return res.status(400).json({error:'La descripción es demasiado larga (máximo 2000 caracteres).'});
     if(!isPromptSafe(prompt))return res.status(400).json({error:'Esa descripción no se puede generar. Prueba con otra escena.'});
     if(await countRecentGenerations(req.session.userId)>=MAX_GENERATIONS_PER_HOUR)return res.status(429).json({error:`Llegaste al límite de ${MAX_GENERATIONS_PER_HOUR} videos por hora.`});
-    const allowedModels=['seedance-2.0-fast','wan-fast','veo']; const safeModel=allowedModels.includes(model)?model:'seedance-2.0-fast';
-    const ratios=['16:9','9:16','1:1']; const safeAspectRatio=ratios.includes(aspectRatio)?aspectRatio:'16:9';
-    const d=Number(duration);const safeDuration=Number.isFinite(d)?Math.min(10,Math.max(2,Math.round(d))):5;
-    if(safeModel==='veo'&&! [4,6,8].includes(safeDuration))return res.status(400).json({error:'Veo funciona con 4, 6 u 8 segundos.'});
-    if(imagePath && !imagePath.startsWith(`images/${req.session.userId}/`))return res.status(400).json({error:'La imagen de referencia no es válida.'});
-    if(imagePath && !imageUrl)return res.status(400).json({error:'Falta la URL temporal de la imagen.'});
-    const params=new URLSearchParams({model:safeModel,aspect_ratio:safeAspectRatio,duration:String(safeDuration)});
-    if(imageUrl)params.set('image',imageUrl); if(audio&&safeModel==='veo')params.set('audio','true');
-    const upstream=await fetch(`https://gen.pollinations.ai/video/${encodeURIComponent(prompt)}?${params.toString()}`,{headers:{Authorization:`Bearer ${pollinationsKey}`}});
-    if(!upstream.ok){const text=await upstream.text().catch(()=> '');console.error('Pollinations video error:',upstream.status,text.slice(0,500));return res.status(upstream.status).json({error:'La generación falló en el proveedor de IA.',detail:text.slice(0,300)});}
-    const buffer=Buffer.from(await upstream.arrayBuffer());
-    const id=crypto.randomUUID();const videoPath=`videos/${req.session.userId}/${id}.mp4`;
+    if(!imagePath || !imagePath.startsWith(`images/${req.session.userId}/`))return res.status(400).json({error:'Wan2.2 necesita una imagen de referencia.'});
+    if(!imageUrl)return res.status(400).json({error:'Falta la URL temporal de la imagen.'});
+    const safeDuration=Math.min(5,Math.max(0.5,Number(duration)||3));
+    const buffer=await generateWanVideo({imageUrl,prompt:prompt.trim(),duration:safeDuration});
+    const id=crypto.randomUUID();
+    const videoPath=`videos/${req.session.userId}/${id}.mp4`;
     await storageUpload(videoPath,buffer,'video/mp4');
     const createdAt=new Date().toISOString();
     try {
-      await createGeneration({id,userId:req.session.userId,prompt:prompt.trim(),model:safeModel,aspectRatio:safeAspectRatio,duration:safeDuration,audio:!!(audio&&safeModel==='veo'),hasImage:!!imagePath,imagePath:imagePath||null,videoPath,createdAt});
+      await createGeneration({id,userId:req.session.userId,prompt:prompt.trim(),model:'wan2.2-i2v-free',aspectRatio:'source',duration:safeDuration,audio:false,hasImage:true,imagePath,videoPath,createdAt});
     } catch (dbError) {
       await storageRemove([videoPath]);
       throw dbError;
     }
-    res.setHeader('Content-Type','video/mp4');res.setHeader('X-Generation-Id',id);res.send(buffer);
-  }catch(e){console.error(e);res.status(502).json({error:'No se pudo completar la generación. Intenta de nuevo en unos minutos.'});}
+    res.setHeader('Content-Type','video/mp4');
+    res.setHeader('X-Generation-Id',id);
+    res.send(buffer);
+  }catch(e){
+    console.error('Wan2.2 generation error:',e);
+    const status=e.statusCode||502;
+    res.status(status).json({error:status===429?'Has alcanzado el límite gratuito diario de Hugging Face.':'No se pudo completar la generación con Wan2.2.',detail:e.message||'Error desconocido.'});
+  }
 });
 
-app.get('/health',(req,res)=>res.json({ok:true}));
+app.get('/health',(req,res)=>res.json({ok:true,provider:'huggingface-wan2.2'}));
 app.get('/login.html',(req,res)=>{res.setHeader('Cache-Control','no-store');res.sendFile(path.join(__dirname,'public','login.html'));});
 app.get('/',(req,res)=>{res.setHeader('Cache-Control','no-store');res.sendFile(path.join(__dirname,'public','index.html'));});
 
 app.use((err,req,res,next)=>{
   console.error('Unhandled request error:', err);
-  if (err instanceof multer.MulterError) {
-    return res.status(400).json({error:err.message||'Error en la carga del archivo.'});
-  }
-  if (err instanceof SyntaxError && 'body' in err) {
-    return res.status(400).json({error:'JSON de la solicitud no válido.'});
-  }
+  if (err instanceof multer.MulterError) return res.status(400).json({error:err.message||'Error en la carga del archivo.'});
+  if (err instanceof SyntaxError && 'body' in err) return res.status(400).json({error:'JSON de la solicitud no válido.'});
   return res.status(500).json({error:'Error interno del servidor.'});
 });
 
