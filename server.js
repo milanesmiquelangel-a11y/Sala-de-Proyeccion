@@ -203,7 +203,7 @@ app.post('/api/generate-video',requireLogin,async(req,res)=>{
     if(prompt.length>2000)return res.status(400).json({error:'La descripción es demasiado larga (máximo 2000 caracteres).'});
     if(!isPromptSafe(prompt))return res.status(400).json({error:'Esa descripción no se puede generar. Prueba con otra escena.'});
     if(await countRecentGenerations(req.session.userId)>=MAX_GENERATIONS_PER_HOUR)return res.status(429).json({error:`Llegaste al límite de ${MAX_GENERATIONS_PER_HOUR} videos por hora.`});
-    const allowedModels=['seedance','wan-fast','veo']; const safeModel=allowedModels.includes(model)?model:'seedance';
+    const allowedModels=['seedance-2.0-fast','wan-fast','veo']; const safeModel=allowedModels.includes(model)?model:'seedance-2.0-fast';
     const ratios=['16:9','9:16','1:1']; const safeAspectRatio=ratios.includes(aspectRatio)?aspectRatio:'16:9';
     const d=Number(duration);const safeDuration=Number.isFinite(d)?Math.min(10,Math.max(2,Math.round(d))):5;
     if(safeModel==='veo'&&! [4,6,8].includes(safeDuration))return res.status(400).json({error:'Veo funciona con 4, 6 u 8 segundos.'});
@@ -212,7 +212,7 @@ app.post('/api/generate-video',requireLogin,async(req,res)=>{
     const params=new URLSearchParams({model:safeModel,key:POLLINATIONS_API_KEY,aspect_ratio:safeAspectRatio,duration:String(safeDuration)});
     if(imageUrl)params.set('image',imageUrl); if(audio&&safeModel==='veo')params.set('audio','true');
     const upstream=await fetch(`https://gen.pollinations.ai/video/${encodeURIComponent(prompt)}?${params.toString()}`);
-    if(!upstream.ok){const text=await upstream.text().catch(()=> '');return res.status(upstream.status).json({error:'La generación falló en el proveedor de IA.',detail:text.slice(0,300)});}
+    if(!upstream.ok){const text=await upstream.text().catch(()=> '');console.error('Pollinations video error:',upstream.status,text.slice(0,500));return res.status(upstream.status).json({error:'La generación falló en el proveedor de IA.',detail:text.slice(0,300)});}
     const buffer=Buffer.from(await upstream.arrayBuffer());
     const id=crypto.randomUUID();const videoPath=`videos/${req.session.userId}/${id}.mp4`;
     await storageUpload(videoPath,buffer,'video/mp4');
