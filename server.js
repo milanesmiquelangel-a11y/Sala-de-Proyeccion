@@ -17,10 +17,12 @@ const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toSt
 const MAX_GENERATIONS_PER_HOUR = parseInt(process.env.MAX_GENERATIONS_PER_HOUR || '5', 10);
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
 const USE_SUPABASE = !!(process.env.SUPABASE_URL && SUPABASE_SECRET_KEY);
+const USE_PG_SESSION = process.env.USE_PG_SESSION === 'true';
 const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'media';
 
 if (!POLLINATIONS_API_KEY) console.error('Falta POLLINATIONS_API_KEY.');
 if (!USE_SUPABASE) console.warn('Supabase no está configurado. El proyecto usará almacenamiento local temporal.');
+if (!USE_PG_SESSION) console.warn('Sesiones PostgreSQL desactivadas temporalmente; se usa almacenamiento de sesión en memoria.');
 
 let supabase = null;
 let pgPool = null;
@@ -71,7 +73,7 @@ const sessionOptions = {
   saveUninitialized: false,
   cookie: { maxAge: 30 * 24 * 60 * 60 * 1000, sameSite: 'lax', httpOnly: true, secure: process.env.NODE_ENV === 'production' }
 };
-if (pgPool) sessionOptions.store = new PgSession({ pool: pgPool, createTableIfMissing: true });
+if (pgPool && USE_PG_SESSION) sessionOptions.store = new PgSession({ pool: pgPool, createTableIfMissing: true });
 app.use(session(sessionOptions));
 
 app.use('/uploads', express.static(uploadsDir, { maxAge: '7d', immutable: true }));
