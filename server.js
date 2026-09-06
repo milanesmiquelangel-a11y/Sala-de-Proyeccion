@@ -30,6 +30,7 @@ if (USE_SUPABASE) {
   });
   if (process.env.DATABASE_URL) {
     pgPool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+    pgPool.on('error', (err) => console.error('PostgreSQL pool error:', err));
   }
 }
 
@@ -163,7 +164,7 @@ app.post('/api/register', async (req,res)=>{
     const user={id:crypto.randomUUID(),email:email.trim(),password_hash:await bcrypt.hash(password,10),created_at:new Date().toISOString()};
     await createUser(USE_SUPABASE?user:{id:user.id,email:user.email,passwordHash:user.password_hash,createdAt:user.created_at});
     req.session.userId=user.id; res.json({email:user.email});
-  } catch(e){ console.error(e); res.status(500).json({error:'No se pudo crear la cuenta.'}); }
+  } catch(e){ console.error('Register error:',e); res.status(500).json({error:'No se pudo crear la cuenta.'}); }
 });
 
 app.post('/api/login', async (req,res)=>{
@@ -172,10 +173,10 @@ app.post('/api/login', async (req,res)=>{
     const hash=user?.password_hash||user?.passwordHash;
     if(!user||!(await bcrypt.compare(password||'',hash||'')))return res.status(401).json({error:'Correo o contraseña incorrectos.'});
     req.session.userId=user.id; res.json({email:user.email});
-  } catch(e){ console.error(e); res.status(500).json({error:'No se pudo iniciar sesión.'}); }
+  } catch(e){ console.error('Login error:',e); res.status(500).json({error:'No se pudo iniciar sesión.'}); }
 });
 app.post('/api/logout',(req,res)=>req.session.destroy(()=>res.json({ok:true})));
-app.get('/api/me',async(req,res)=>{try{if(!req.session.userId)return res.status(401).json({error:'No has iniciado sesión.'});const u=await dbUserById(req.session.userId);if(!u)return res.status(401).json({error:'Sesión inválida.'});res.json({email:u.email});}catch(e){res.status(500).json({error:'Error de sesión.'});}});
+app.get('/api/me',async(req,res)=>{try{if(!req.session.userId)return res.status(401).json({error:'No has iniciado sesión.'});const u=await dbUserById(req.session.userId);if(!u)return res.status(401).json({error:'Sesión inválida.'});res.json({email:u.email});}catch(e){console.error('Session lookup error:',e);res.status(500).json({error:'Error de sesión.'});}});
 
 app.get('/api/history',requireLogin,async(req,res)=>{
   try{const rows=await listGenerations(req.session.userId);const generations=await Promise.all(rows.map(async g=>({...g,videoUrl:await signedUrl(g.videoPath),imageUrl:g.imagePath?await signedUrl(g.imagePath):null})));res.json({generations});}
@@ -225,10 +226,19 @@ app.post('/api/generate-video',requireLogin,async(req,res)=>{
 });
 
 app.get('/health',(req,res)=>res.json({ok:true}));
-app.get('/login.html',(req,res)=>res.sendFile(path.join(__dirname,'public','login.html')));
-app.get('/',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));
+app.get('/login.html',(req,res)=>{res.setHeader('Cache-Control','no-store');res.sendFile(path.join(__dirname,'public','login.html'));});
+app.get('/',(req,res)=>{res.setHeader('Cache-Control','no-store');res.sendFile(path.join(__dirname,'public','index.html'));});
 
-app.use((err,req,res,next)=>{if(err instanceof multer.MulterError||err) return res.status(400).json({error:err.message||'Solicitud inválida.'});next(err);});
+app.use((err,req,res,next)=>{
+  console.error('Unhandled request error:', err);
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({error:err.message||'Error en la carga del archivo.'});
+  }
+  if (err instanceof SyntaxError && 'body' in err) {
+    return res.status(400).json({error:'JSON de la solicitud no válido.'});
+  }
+  return res.status(500).json({error:'Error interno del servidor.'});
+});
 
 app.set('trust proxy', 1);
 app.listen(PORT, '0.0.0.0', ()=>console.log(`Sala de Proyección corriendo en http://localhost:${PORT}`));
