@@ -7,9 +7,14 @@ const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const crypto = require('crypto');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const { createClient } = require('@supabase/supabase-js');
 const { Client, handle_file } = require('@gradio/client');
+const ffmpegPath = require('ffmpeg-static');
+const execFileAsync = promisify(execFile);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -22,9 +27,9 @@ const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'media';
 const HF_TOKEN = process.env.HF_TOKEN;
 const HF_SPACE = 'zerogpu-aoti/wan2-2-fp8da-aoti-faster';
 
-if (!HF_TOKEN) console.warn('HF_TOKEN no está configurado. La generación Wan2.2 permanecerá desactivada hasta añadirlo en Render.');
-if (!USE_SUPABASE) console.warn('Supabase no está configurado. El proyecto usará almacenamiento local temporal.');
-if (!USE_PG_SESSION) console.warn('Sesiones PostgreSQL desactivadas temporalmente; se usa almacenamiento de sesión en memoria.');
+if (!HF_TOKEN) console.warn('HF_TOKEN no está configurado.');
+if (!USE_SUPABASE) console.warn('Supabase no está configurado.');
+if (!USE_PG_SESSION) console.warn('Sesiones PostgreSQL desactivadas temporalmente; se usa memoria.');
 
 let supabase = null;
 let pgPool = null;
@@ -32,7 +37,7 @@ if (USE_SUPABASE) {
   supabase = createClient(process.env.SUPABASE_URL, SUPABASE_SECRET_KEY, { auth: { persistSession: false, autoRefreshToken: false } });
   if (process.env.DATABASE_URL) {
     pgPool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-    pgPool.on('error', (err) => console.error('PostgreSQL pool error:', err));
+    pgPool.on('error', err => console.error('PostgreSQL pool error:', err));
   }
 }
 
@@ -74,7 +79,6 @@ const sessionOptions = {
 };
 if (pgPool && USE_PG_SESSION) sessionOptions.store = new PgSession({ pool: pgPool, createTableIfMissing: true });
 app.use(session(sessionOptions));
-
 app.use('/uploads', express.static(uploadsDir, { maxAge: '7d', immutable: true }));
 app.use('/videos', express.static(videosDir, { maxAge: '30d' }));
 app.use(express.static(path.join(__dirname, 'public'), { index: false }));
@@ -131,7 +135,7 @@ app.post('/api/login',async(req,res)=>{try{const {email,password}=req.body||{};c
 app.post('/api/logout',(req,res)=>req.session.destroy(()=>res.json({ok:true})));
 app.get('/api/me',async(req,res)=>{try{if(!req.session.userId)return res.status(401).json({error:'No has iniciado sesión.'});const u=await dbUserById(req.session.userId);if(!u)return res.status(401).json({error:'Sesión inválida.'});res.json({email:u.email});}catch(e){console.error('Session lookup error:',e);res.status(500).json({error:'Error de sesión.'});}});
 
-app.get('/api/video-provider/status',requireLogin,(req,res)=>res.json({configured:!!HF_TOKEN,provider:'Hugging Face ZeroGPU',space:HF_SPACE,requiresImage:true,maxDuration:5}));
+app.get('/api/video-provider/status',requireLogin,(req,res)=>res.json({configured:!!HF_TOKEN,provider:'Hugging Face ZeroGPU',space:HF_SPACE,requiresImage:true,maxDuration:5,maxScenes:6,maxStoryboardDuration:30}));
 app.get('/api/history',requireLogin,async(req,res)=>{try{const rows=await listGenerations(req.session.userId);const generations=await Promise.all(rows.map(async g=>({...g,videoUrl:await signedUrl(g.videoPath),imageUrl:g.imagePath?await signedUrl(g.imagePath):null})));res.json({generations});}catch(e){console.error(e);res.status(500).json({error:'No se pudo cargar el historial.'});}});
 app.post('/api/upload',requireLogin,upload.single('image'),async(req,res)=>{try{if(!req.file)return res.status(400).json({error:'No se recibió ninguna imagen.'});const ext=req.file.mimetype==='image/png'?'.png':req.file.mimetype==='image/webp'?'.webp':'.jpg';const filePath=`images/${req.session.userId}/${crypto.randomUUID()}${ext}`;await storageUpload(filePath,req.file.buffer,req.file.mimetype);const url=await signedUrl(filePath,7200);res.json({url,path:filePath});}catch(e){console.error(e);res.status(500).json({error:'No se pudo guardar la imagen.'});}});
 app.delete('/api/history/:id',requireLogin,async(req,res)=>{try{const g=await deleteGeneration(req.params.id,req.session.userId);if(!g)return res.status(404).json({error:'Video no encontrado.'});await storageRemove([g.videoPath,g.imagePath]);res.json({ok:true});}catch(e){console.error(e);res.status(500).json({error:'No se pudo eliminar el video.'});}});
@@ -141,9 +145,7 @@ async function generateWanVideo({imageUrl,prompt,duration}){
   if(!HF_TOKEN)throw Object.assign(new Error('Hugging Face no está configurado todavía.'),{statusCode:503});
   const client=await Client.connect(HF_SPACE,{token:HF_TOKEN});
   const safeDuration=Math.min(5,Math.max(0.5,Number(duration)||3));
-  const result=await client.predict('/generate_video',{
-    input_image:handle_file(imageUrl),prompt,steps:4,negative_prompt:HF_NEGATIVE_PROMPT,duration_seconds:safeDuration,guidance_scale:1,guidance_scale_2:1,seed:Math.floor(Math.random()*2147483647),randomize_seed:true
-  });
+  const result=await client.predict('/generate_video',{input_image:handle_file(imageUrl),prompt,steps:4,negative_prompt:HF_NEGATIVE_PROMPT,duration_seconds:safeDuration,guidance_scale:1,guidance_scale_2:1,seed:Math.floor(Math.random()*2147483647),randomize_seed:true});
   const value=result?.data?.[0];
   const videoUrl=typeof value==='string'?value:(value?.url||value?.video?.url||value?.path);
   if(!videoUrl)throw new Error('Wan2.2 no devolvió el vídeo.');
@@ -166,6 +168,36 @@ app.post('/api/generate-video',requireLogin,async(req,res)=>{try{
   try{await createGeneration({id,userId:req.session.userId,prompt:prompt.trim(),model:'wan2.2-i2v-free',aspectRatio:'source',duration:safeDuration,audio:false,hasImage:true,imagePath,videoPath,createdAt});}catch(dbError){await storageRemove([videoPath]);throw dbError;}
   res.setHeader('Content-Type','video/mp4');res.setHeader('X-Generation-Id',id);res.send(buffer);
 }catch(e){console.error('Wan2.2 generation error:',e);const status=e.statusCode||502;res.status(status).json({error:status===429?'Has alcanzado el límite gratuito diario de Hugging Face.':'No se pudo completar la generación con Wan2.2.',detail:e.message||'Error desconocido.'});}});
+
+function makeConcatFile(paths){const file=path.join(os.tmpdir(),`concat-${crypto.randomUUID()}.txt`);fs.writeFileSync(file,paths.map(p=>`file '${p.replace(/'/g,"'\\''")}'`).join('\n'));return file;}
+async function stitchVideos(buffers){
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'sala-stitch-'));const inputs=[];let concatFile=null;const output=path.join(dir,'final.mp4');
+  try{
+    for(let i=0;i<buffers.length;i++){const p=path.join(dir,`scene-${i}.mp4`);fs.writeFileSync(p,buffers[i]);inputs.push(p);}
+    concatFile=makeConcatFile(inputs);
+    await execFileAsync(ffmpegPath,['-y','-f','concat','-safe','0','-i',concatFile,'-c','copy',output],{maxBuffer:1024*1024*4});
+    return fs.readFileSync(output);
+  } finally { try{if(concatFile)fs.unlinkSync(concatFile);}catch{} try{fs.rmSync(dir,{recursive:true,force:true});}catch{} }
+}
+
+app.post('/api/generate-storyboard',requireLogin,async(req,res)=>{try{
+  if(!HF_TOKEN)return res.status(503).json({error:'La generación gratuita de Wan2.2 todavía no está configurada en el servidor.'});
+  const {prompt,scenes}=req.body||{};
+  if(!prompt||typeof prompt!=='string'||!prompt.trim())return res.status(400).json({error:'Falta describir la historia o estilo de las escenas.'});
+  if(prompt.length>2000)return res.status(400).json({error:'La descripción es demasiado larga (máximo 2000 caracteres).'});
+  if(!isPromptSafe(prompt))return res.status(400).json({error:'Esa descripción no se puede generar. Prueba con otra escena.'});
+  if(!Array.isArray(scenes)||scenes.length<2||scenes.length>6)return res.status(400).json({error:'Selecciona entre 2 y 6 imágenes para el vídeo por escenas.'});
+  if(await countRecentGenerations(req.session.userId)+scenes.length>MAX_GENERATIONS_PER_HOUR)return res.status(429).json({error:`El límite actual es de ${MAX_GENERATIONS_PER_HOUR} generaciones por hora. Este vídeo necesita ${scenes.length}.`});
+  const buffers=[];const paths=[];const perScene=Math.max(0.5,Math.min(5,5));
+  for(let i=0;i<scenes.length;i++){
+    const scene=scenes[i]||{};if(!scene.imagePath||!scene.imagePath.startsWith(`images/${req.session.userId}/`)||!scene.imageUrl)throw new Error(`La escena ${i+1} no tiene una imagen válida.`);
+    const scenePrompt=(scene.prompt||prompt).toString().trim();if(!scenePrompt||scenePrompt.length>2000||!isPromptSafe(scenePrompt))throw new Error(`La descripción de la escena ${i+1} no es válida.`);
+    buffers.push(await generateWanVideo({imageUrl:scene.imageUrl,prompt:scenePrompt,duration:perScene}));paths.push(scene.imagePath);
+  }
+  const finalBuffer=await stitchVideos(buffers);const id=crypto.randomUUID();const videoPath=`videos/${req.session.userId}/${id}.mp4`;await storageUpload(videoPath,finalBuffer,'video/mp4');const createdAt=new Date().toISOString();
+  try{await createGeneration({id,userId:req.session.userId,prompt:prompt.trim(),model:'wan2.2-storyboard',aspectRatio:'source',duration:scenes.length*perScene,audio:false,hasImage:true,imagePath:paths[0],videoPath,createdAt});}catch(dbError){await storageRemove([videoPath]);throw dbError;}
+  res.setHeader('Content-Type','video/mp4');res.setHeader('X-Generation-Id',id);res.send(finalBuffer);
+}catch(e){console.error('Storyboard generation error:',e);const status=e.statusCode||502;res.status(status).json({error:status===429?e.message:'No se pudo completar el vídeo por escenas.',detail:e.message||'Error desconocido.'});}});
 
 app.get('/health',(req,res)=>res.json({ok:true,provider:'huggingface-wan2.2'}));
 app.get('/login.html',(req,res)=>{res.setHeader('Cache-Control','no-store');res.sendFile(path.join(__dirname,'public','login.html'));});
