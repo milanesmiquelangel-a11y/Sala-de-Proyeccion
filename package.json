@@ -1,11 +1,11 @@
 {
   "name": "sala-de-proyeccion",
-  "version": "4.1.0",
+  "version": "4.1.1",
   "description": "Sala de Proyección — generación de video con Wan2.2/Gradio y PostgreSQL/Supabase Storage.",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
   "dependencies": {
-    "@gradio/client": "^2.1.0",
+    "@gradio/client": "^2.5.1",
     "@supabase/supabase-js": "^2.57.0",
     "bcryptjs": "^2.4.3",
     "connect-pg-simple": "^10.0.0",
